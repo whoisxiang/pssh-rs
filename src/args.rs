@@ -28,6 +28,10 @@ pub struct CommandLineArgs {
     /// Keep the output stable order with designated hosts.
     #[structopt(short = "k", long = "keep_stable")]
     pub keep_stable: bool,
+
+    /// Print detailed diagnostics while sending files.
+    #[structopt(long, global = true)]
+    pub debug: bool,
 }
 
 #[derive(Clone, Debug, StructOpt)]
@@ -151,4 +155,21 @@ fn get_timeout_ms(value: Option<&Value>) -> anyhow::Result<Option<u32>> {
 
     let value = value.as_integer().ok_or_else(|| anyhow!("timeout_ms should be an u32"))?;
     Ok(Some(value.try_into().context("timeout_ms should be valid u32")?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CommandLineArgs;
+    use structopt::StructOpt;
+
+    #[test]
+    fn debug_flag_is_global() {
+        let before_subcommand =
+            CommandLineArgs::from_iter_safe(["pssh-rs", "--debug", "send", "source.txt", "/tmp/source.txt"]).unwrap();
+        let after_subcommand =
+            CommandLineArgs::from_iter_safe(["pssh-rs", "send", "source.txt", "/tmp/source.txt", "--debug"]).unwrap();
+
+        assert!(before_subcommand.debug);
+        assert!(after_subcommand.debug);
+    }
 }

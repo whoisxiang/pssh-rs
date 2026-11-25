@@ -28,6 +28,13 @@ run `date` on all nginx hosts
 ./pssh-rs --config=./hosts.toml send ./hello.txt /tmp/
 ```
 
+Add `--debug` to print the upload stages and connection details when diagnosing
+an SCP transfer failure:
+
+```bash
+./pssh-rs --debug --config=./hosts.toml send ./hello.txt /tmp/
+```
+
 ## Install
 
 just run `cargo install pssh-rs` to install.

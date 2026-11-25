@@ -1,5 +1,5 @@
 use ansi_term::Colour::{Green, Red};
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use args::HostInfo;
 use rayon::prelude::*;
 use ssh2::Session;
@@ -69,7 +69,9 @@ fn main() -> anyhow::Result<()> {
         hosts.par_iter().enumerate().for_each(|(index, host)| {
             let result = match &args.command {
                 args::Command::Run { command } => run_command(host, command),
-                args::Command::Send { source_fpath, target_fpath } => send_file(host, source_fpath, target_fpath),
+                args::Command::Send { source_fpath, target_fpath } => {
+                    send_file(host, source_fpath, target_fpath, args.debug)
+                }
                 _ => {
                     panic!("shoud not come here")
                 }
@@ -131,29 +133,96 @@ fn run_command(host: &HostInfo, command: &str) -> anyhow::Result<Outcome> {
     Ok(Outcome::RunCommandOutcome(RunCommandOutcome { exit_status, out, err }))
 }
 
-fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path) -> anyhow::Result<Outcome> {
+fn debug_send(debug: bool, host: &HostInfo, stage: &str, detail: impl std::fmt::Display) {
+    if debug {
+        eprintln!("[{}:{} DEBUG] send/{stage}: {detail}", host.host, host.port);
+    }
+}
+
+fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: bool) -> anyhow::Result<Outcome> {
     let addr = format!("{}:{}", host.host, host.port);
-    let tcp = TcpStream::connect_timeout(&addr.parse()?, Duration::from_millis(host.timeout_ms as u64))?;
-    let mut sess = Session::new()?;
+
+    debug_send(
+        debug,
+        host,
+        "start",
+        format_args!(
+            "source={} target={} user={} timeout={}ms",
+            source_fpath.display(),
+            target_fpath.display(),
+            host.username,
+            host.timeout_ms
+        ),
+    );
+
+    let attr = metadata(source_fpath)
+        .with_context(|| format!("stat local source file {}", source_fpath.display()))?;
+    if !attr.is_file() {
+        return Err(anyhow!("source is not a regular file: {}", source_fpath.display()));
+    }
+
+    let mode = attr.permissions().mode() & 0o777;
+    debug_send(debug, host, "source", format_args!("size={} mode={mode:03o}", attr.len()));
+
+    let mut file =
+        File::open(source_fpath).with_context(|| format!("open local source file {}", source_fpath.display()))?;
+    debug_send(debug, host, "source", "opened local source file");
+
+    let socket_addr = addr.parse().with_context(|| format!("parse SSH address {addr}"))?;
+    let tcp = TcpStream::connect_timeout(&socket_addr, Duration::from_millis(host.timeout_ms as u64))
+        .with_context(|| format!("connect to {addr} with timeout {}ms", host.timeout_ms))?;
+    debug_send(debug, host, "transport", "TCP connection established");
+
+    let mut sess = Session::new().with_context(|| format!("initialize SSH session for {addr}"))?;
     sess.set_tcp_stream(tcp);
     sess.set_timeout(host.timeout_ms);
-    sess.handshake()?;
+    sess.handshake().with_context(|| format!("perform SSH handshake with {addr}"))?;
+    debug_send(debug, host, "transport", "SSH handshake completed");
+
     sess.set_timeout(0);
-    sess.userauth_password(&host.username, &host.password)?;
+    sess.userauth_password(&host.username, &host.password)
+        .with_context(|| format!("authenticate user {} on {addr}", host.username))?;
+    debug_send(debug, host, "transport", "SSH authentication succeeded");
 
-    let attr = metadata(source_fpath).with_context(|| format!("stat local {}", source_fpath.to_string_lossy()))?;
-    let mode = attr.permissions().mode() & 0o777;
+    debug_send(debug, host, "scp", "opening remote target");
+    let mut remote_file = sess
+        .scp_send(target_fpath, mode as i32, attr.len(), None)
+        .with_context(|| format!("open remote SCP target {}", target_fpath.display()))?;
+    debug_send(debug, host, "scp", "remote target opened");
 
-    let mut remote_file = sess.scp_send(target_fpath, mode as i32, attr.len(), None)?;
-
-    let mut file = File::open(source_fpath)?;
-    std::io::copy(&mut file, &mut remote_file)?;
+    let copied = std::io::copy(&mut file, &mut remote_file).with_context(|| {
+        format!(
+            "transfer local file {} to remote {}",
+            source_fpath.display(),
+            target_fpath.display()
+        )
+    })?;
+    if copied != attr.len() {
+        return Err(anyhow!(
+            "uploaded byte count mismatch for {}: expected {}, transferred {}",
+            source_fpath.display(),
+            attr.len(),
+            copied
+        ));
+    }
+    debug_send(debug, host, "scp", format_args!("transfer complete: {copied} bytes"));
 
     // Close the channel and wait for the whole content to be transferred
-    remote_file.send_eof()?;
-    remote_file.wait_eof()?;
-    remote_file.close()?;
-    remote_file.wait_close()?;
+    remote_file
+        .send_eof()
+        .with_context(|| format!("send EOF to remote SCP target {}", target_fpath.display()))?;
+    remote_file
+        .wait_eof()
+        .with_context(|| format!("wait for remote SCP target {} to receive EOF", target_fpath.display()))?;
+    debug_send(debug, host, "scp", "remote target received EOF");
+
+    remote_file
+        .close()
+        .with_context(|| format!("close remote SCP target {}", target_fpath.display()))?;
+    remote_file
+        .wait_close()
+        .with_context(|| format!("wait for remote SCP target {} to close", target_fpath.display()))?;
+    debug_send(debug, host, "finish", format_args!("uploaded {copied} bytes successfully"));
 
     Ok(Outcome::SendFileOutcome)
 }
