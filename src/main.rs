@@ -9,7 +9,7 @@ use std::io::prelude::*;
 use std::io::Write;
 use std::net::TcpStream;
 use std::os::unix::prelude::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::sync_channel;
 use std::time::Duration;
 use structopt::StructOpt;
@@ -152,6 +152,17 @@ fn debug_send(debug: bool, host: &HostInfo, stage: &str, detail: impl std::fmt::
     }
 }
 
+fn resolve_remote_target(source_fpath: &Path, target_fpath: &Path) -> anyhow::Result<PathBuf> {
+    if !target_fpath.as_os_str().is_empty() && !target_fpath.to_string_lossy().ends_with('/') {
+        return Ok(target_fpath.to_path_buf());
+    }
+
+    let source_file_name = source_fpath
+        .file_name()
+        .ok_or_else(|| anyhow!("source path has no file name: {}", source_fpath.display()))?;
+    Ok(target_fpath.join(source_file_name))
+}
+
 fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: bool) -> anyhow::Result<Outcome> {
     let addr = format!("{}:{}", host.host, host.port);
 
@@ -175,7 +186,18 @@ fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: b
     }
 
     let mode = attr.permissions().mode() & 0o777;
+    let remote_target_fpath = resolve_remote_target(source_fpath, target_fpath)?;
     debug_send(debug, host, "source", format_args!("size={} mode={mode:03o}", attr.len()));
+    debug_send(
+        debug,
+        host,
+        "target",
+        format_args!(
+            "requested={} resolved={}",
+            target_fpath.display(),
+            remote_target_fpath.display()
+        ),
+    );
 
     let mut file =
         File::open(source_fpath).with_context(|| format!("open local source file {}", source_fpath.display()))?;
@@ -199,15 +221,15 @@ fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: b
 
     debug_send(debug, host, "scp", "opening remote target");
     let mut remote_file = sess
-        .scp_send(target_fpath, mode as i32, attr.len(), None)
-        .with_context(|| format!("open remote SCP target {}", target_fpath.display()))?;
+        .scp_send(&remote_target_fpath, mode as i32, attr.len(), None)
+        .with_context(|| format!("open remote SCP target {}", remote_target_fpath.display()))?;
     debug_send(debug, host, "scp", "remote target opened");
 
     let copied = std::io::copy(&mut file, &mut remote_file).with_context(|| {
         format!(
             "transfer local file {} to remote {}",
             source_fpath.display(),
-            target_fpath.display()
+            remote_target_fpath.display()
         )
     })?;
     if copied != attr.len() {
@@ -223,18 +245,18 @@ fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: b
     // Close the channel and wait for the whole content to be transferred
     remote_file
         .send_eof()
-        .with_context(|| format!("send EOF to remote SCP target {}", target_fpath.display()))?;
+        .with_context(|| format!("send EOF to remote SCP target {}", remote_target_fpath.display()))?;
     remote_file
         .wait_eof()
-        .with_context(|| format!("wait for remote SCP target {} to receive EOF", target_fpath.display()))?;
+        .with_context(|| format!("wait for remote SCP target {} to receive EOF", remote_target_fpath.display()))?;
     debug_send(debug, host, "scp", "remote target received EOF");
 
     remote_file
         .close()
-        .with_context(|| format!("close remote SCP target {}", target_fpath.display()))?;
+        .with_context(|| format!("close remote SCP target {}", remote_target_fpath.display()))?;
     remote_file
         .wait_close()
-        .with_context(|| format!("wait for remote SCP target {} to close", target_fpath.display()))?;
+        .with_context(|| format!("wait for remote SCP target {} to close", remote_target_fpath.display()))?;
     debug_send(debug, host, "finish", format_args!("uploaded {copied} bytes successfully"));
 
     Ok(Outcome::SendFileOutcome)
@@ -302,4 +324,26 @@ fn print_command_outcome(addr: &str, outcomd: &RunCommandOutcome) -> anyhow::Res
     std::io::stdout().write_all(&outcomd.err)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_remote_target;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn resolves_directory_target_to_source_file_name() {
+        assert_eq!(
+            resolve_remote_target(Path::new("./1.txt"), Path::new("/tmp/")).unwrap(),
+            PathBuf::from("/tmp/1.txt")
+        );
+    }
+
+    #[test]
+    fn keeps_explicit_remote_file_path() {
+        assert_eq!(
+            resolve_remote_target(Path::new("./1.txt"), Path::new("/tmp/renamed.txt")).unwrap(),
+            PathBuf::from("/tmp/renamed.txt")
+        );
+    }
 }
