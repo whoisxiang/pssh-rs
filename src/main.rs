@@ -37,8 +37,15 @@ hosts = [
 ]          
 "#;
 
+fn debug_log(debug: bool, scope: &str, detail: impl std::fmt::Display) {
+    if debug {
+        eprintln!("[DEBUG] {scope}: {detail}");
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let args = args::CommandLineArgs::from_args();
+    debug_log(args.debug, "main", format_args!("debug output enabled for command={}", args.command.name()));
 
     if let args::Command::Init = args.command {
         if std::fs::exists(DEFAULT_CONFIG_FPATH)? {
@@ -55,6 +62,12 @@ fn main() -> anyhow::Result<()> {
     }
 
     let hosts = args.get_hosts()?;
+    debug_log(args.debug, "hosts", format_args!("loaded {} target(s)", hosts.len()));
+    if hosts.is_empty() {
+        eprintln!("no hosts found in config");
+        return Ok(());
+    }
+
     let (sender, receiver) = sync_channel(hosts.len());
 
     std::thread::scope(|s| {

@@ -30,7 +30,7 @@ pub struct CommandLineArgs {
     pub keep_stable: bool,
 
     /// Print detailed diagnostics while sending files.
-    #[structopt(long, global = true)]
+    #[structopt(short, long, global = true)]
     pub debug: bool,
 }
 
@@ -55,6 +55,16 @@ pub enum Command {
         #[structopt(parse(from_os_str))]
         target_fpath: PathBuf,
     },
+}
+
+impl Command {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Command::Init => "init",
+            Command::Run { .. } => "run",
+            Command::Send { .. } => "send",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -168,8 +178,11 @@ mod tests {
             CommandLineArgs::from_iter_safe(["pssh-rs", "--debug", "send", "source.txt", "/tmp/source.txt"]).unwrap();
         let after_subcommand =
             CommandLineArgs::from_iter_safe(["pssh-rs", "send", "source.txt", "/tmp/source.txt", "--debug"]).unwrap();
+        let short_flag =
+            CommandLineArgs::from_iter_safe(["pssh-rs", "-d", "send", "source.txt", "/tmp/source.txt"]).unwrap();
 
         assert!(before_subcommand.debug);
         assert!(after_subcommand.debug);
+        assert!(short_flag.debug);
     }
 }

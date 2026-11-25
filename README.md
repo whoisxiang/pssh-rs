@@ -28,8 +28,9 @@ run `date` on all nginx hosts
 ./pssh-rs --config=./hosts.toml send ./hello.txt /tmp/
 ```
 
-Add `--debug` to print the upload stages and connection details when diagnosing
-an SCP transfer failure:
+Add `-d` or `--debug` to print upload stages and connection details to `stderr`
+when diagnosing an SCP transfer failure. The global flag can be placed before or
+after the subcommand:
 
 ```bash
 ./pssh-rs --debug --config=./hosts.toml send ./hello.txt /tmp/
