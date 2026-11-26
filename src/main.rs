@@ -1,6 +1,6 @@
 use ansi_term::Colour::{Green, Red};
 use anyhow::{anyhow, Context};
-use args::HostInfo;
+use args::{AuthMethod, HostInfo};
 use rayon::prelude::*;
 use ssh2::Session;
 use std::fs::metadata;
@@ -28,7 +28,10 @@ hosts = [
 
 [nginx]
 username = "root"
-password = "123456"
+# SSH private key authentication. Use an absolute path or a path beginning with ~/.
+private_key = "~/.ssh/id_rsa"
+# Omit this option when the private key is not encrypted.
+# private_key_passphrase = "your-passphrase"
 port = 22
 timeout_ms = 10000
 hosts = [
@@ -118,7 +121,7 @@ fn run_command(host: &HostInfo, command: &str) -> anyhow::Result<Outcome> {
     sess.set_timeout(host.timeout_ms);
     sess.handshake()?;
     sess.set_timeout(0);
-    sess.userauth_password(&host.username, &host.password)?;
+    authenticate(host, &sess)?;
 
     let mut channel = sess.channel_session()?;
     let _ = channel.setenv("PSSH_RS_IP", &host.host);
@@ -144,6 +147,25 @@ fn run_command(host: &HostInfo, command: &str) -> anyhow::Result<Outcome> {
 
     let exit_status = channel.exit_status()?;
     Ok(Outcome::RunCommandOutcome(RunCommandOutcome { exit_status, out, err }))
+}
+
+fn authenticate(host: &HostInfo, sess: &Session) -> anyhow::Result<()> {
+    let addr = format!("{}:{}", host.host, host.port);
+
+    match &host.auth {
+        AuthMethod::Password { password } => sess
+            .userauth_password(&host.username, password)
+            .with_context(|| format!("authenticate user {} on {addr} with password", host.username)),
+        AuthMethod::PrivateKey { private_key, passphrase } => sess
+            .userauth_pubkey_file(&host.username, None, private_key, passphrase.as_deref())
+            .with_context(|| {
+                format!(
+                    "authenticate user {} on {addr} with private key {}",
+                    host.username,
+                    private_key.display()
+                )
+            }),
+    }
 }
 
 fn debug_send(debug: bool, host: &HostInfo, stage: &str, detail: impl std::fmt::Display) {
@@ -215,8 +237,7 @@ fn send_file(host: &HostInfo, source_fpath: &Path, target_fpath: &Path, debug: b
     debug_send(debug, host, "transport", "SSH handshake completed");
 
     sess.set_timeout(0);
-    sess.userauth_password(&host.username, &host.password)
-        .with_context(|| format!("authenticate user {} on {addr}", host.username))?;
+    authenticate(host, &sess)?;
     debug_send(debug, host, "transport", "SSH authentication succeeded");
 
     debug_send(debug, host, "scp", "opening remote target");

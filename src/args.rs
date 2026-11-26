@@ -71,9 +71,20 @@ impl Command {
 pub struct HostInfo {
     pub host: String,
     pub username: String,
-    pub password: String,
+    pub auth: AuthMethod,
     pub port: u16,
     pub timeout_ms: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AuthMethod {
+    Password {
+        password: String,
+    },
+    PrivateKey {
+        private_key: PathBuf,
+        passphrase: Option<String>,
+    },
 }
 
 impl CommandLineArgs {
@@ -114,14 +125,14 @@ fn get_hosts_from_table(table: &toml::value::Table) -> anyhow::Result<Vec<HostIn
     let mut res = vec![];
 
     let username = get_username(table.get("username"))?.unwrap_or_else(|| DEFAULT_SSH_USERNAME.to_string());
-    let password = get_password(table.get("password"))?.unwrap_or_default();
+    let auth = get_auth(table)?;
     let port = get_port(table.get("port"))?.unwrap_or(DEFAULT_SSH_PORT);
     let timeout_ms = get_timeout_ms(table.get("timeout_ms"))?.unwrap_or(DEFAULT_SSH_TIMEOUT_MS);
 
     for host in table.get("hosts").iter().flat_map(|a| a.as_array()).flatten().flat_map(|v| v.as_str()) {
         res.push(HostInfo {
             username: username.clone(),
-            password: password.clone(),
+            auth: auth.clone(),
             port,
             host: host.to_string(),
             timeout_ms,
@@ -140,13 +151,46 @@ fn get_username(value: Option<&Value>) -> anyhow::Result<Option<String>> {
     Ok(Some(value.to_string()))
 }
 
-fn get_password(value: Option<&Value>) -> anyhow::Result<Option<String>> {
+fn get_auth(table: &toml::value::Table) -> anyhow::Result<AuthMethod> {
+    let password = get_optional_string(table.get("password"), "password")?;
+    let private_key = get_private_key(table.get("private_key"))?;
+    let passphrase = get_optional_string(table.get("private_key_passphrase"), "private_key_passphrase")?;
+
+    if let Some(private_key) = private_key {
+        return Ok(AuthMethod::PrivateKey { private_key, passphrase });
+    }
+
+    if passphrase.is_some() {
+        return Err(anyhow!("private_key_passphrase requires private_key"));
+    }
+
+    let password = password.ok_or_else(|| anyhow!("either password or private_key should be configured"))?;
+    Ok(AuthMethod::Password { password })
+}
+
+fn get_optional_string(value: Option<&Value>, name: &str) -> anyhow::Result<Option<String>> {
     let Some(value) = value else {
         return Ok(None);
     };
 
-    let value = value.as_str().ok_or_else(|| anyhow!("password should be a string"))?;
+    let value = value.as_str().ok_or_else(|| anyhow!("{name} should be a string"))?;
     Ok(Some(value.to_string()))
+}
+
+fn get_private_key(value: Option<&Value>) -> anyhow::Result<Option<PathBuf>> {
+    let Some(value) = get_optional_string(value, "private_key")? else {
+        return Ok(None);
+    };
+
+    let path = PathBuf::from(value);
+    let Ok(relative_path) = path.strip_prefix("~") else {
+        return Ok(Some(path));
+    };
+
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("cannot expand ~ in private_key because HOME is not set"))?;
+    Ok(Some(home.join(relative_path)))
 }
 
 fn get_port(value: Option<&Value>) -> anyhow::Result<Option<u16>> {
@@ -169,8 +213,10 @@ fn get_timeout_ms(value: Option<&Value>) -> anyhow::Result<Option<u32>> {
 
 #[cfg(test)]
 mod tests {
-    use super::CommandLineArgs;
+    use super::{get_hosts_from_table, AuthMethod, CommandLineArgs};
+    use std::path::PathBuf;
     use structopt::StructOpt;
+    use toml::Value;
 
     #[test]
     fn debug_flag_is_global() {
@@ -184,5 +230,94 @@ mod tests {
         assert!(before_subcommand.debug);
         assert!(after_subcommand.debug);
         assert!(short_flag.debug);
+    }
+
+    #[test]
+    fn parses_password_authentication() {
+        let hosts = parse_hosts(
+            r#"
+username = "deploy"
+password = "secret"
+hosts = ["192.0.2.10"]
+"#,
+        );
+
+        assert_eq!(
+            hosts[0].auth,
+            AuthMethod::Password {
+                password: "secret".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn parses_private_key_authentication_with_passphrase() {
+        let hosts = parse_hosts(
+            r#"
+username = "deploy"
+private_key = "/home/deploy/.ssh/id_rsa"
+private_key_passphrase = "secret"
+hosts = ["192.0.2.10"]
+"#,
+        );
+
+        assert_eq!(
+            hosts[0].auth,
+            AuthMethod::PrivateKey {
+                private_key: PathBuf::from("/home/deploy/.ssh/id_rsa"),
+                passphrase: Some("secret".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn private_key_takes_precedence_over_password() {
+        let hosts = parse_hosts(
+            r#"
+password = "ignored"
+private_key = "/home/deploy/.ssh/id_rsa"
+hosts = ["192.0.2.10"]
+"#,
+        );
+
+        assert!(matches!(&hosts[0].auth, AuthMethod::PrivateKey { .. }));
+    }
+
+    #[test]
+    fn rejects_passphrase_without_private_key() {
+        let value = parse_config(
+            r#"
+password = "secret"
+private_key_passphrase = "unused"
+hosts = ["192.0.2.10"]
+"#,
+        );
+        let Value::Table(table) = value else {
+            panic!("test config should be a table");
+        };
+
+        assert!(get_hosts_from_table(&table).is_err());
+    }
+
+    #[test]
+    fn requires_password_or_private_key() {
+        let value = parse_config(r#"hosts = ["192.0.2.10"]"#);
+        let Value::Table(table) = value else {
+            panic!("test config should be a table");
+        };
+
+        assert!(get_hosts_from_table(&table).is_err());
+    }
+
+    fn parse_hosts(config: &str) -> Vec<super::HostInfo> {
+        let value = parse_config(config);
+        let Value::Table(table) = value else {
+            panic!("test config should be a table");
+        };
+        get_hosts_from_table(&table).unwrap()
+    }
+
+    fn parse_config(config: &str) -> Value {
+        config.parse::<Value>().unwrap()
     }
 }
